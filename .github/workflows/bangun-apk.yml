@@ -1,0 +1,1146 @@
+# tanda-tangan-pribadi: v13
+name: Bangun APK Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  bangun:
+    name: Kompilasi APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ambil kode sumber
+        uses: actions/checkout@v4
+
+      - name: Periksa tanda tangan pribadi
+        id: tt
+        run: |
+          if [ -f .tanda-tangan/kunci.p12 ] && [ -f .tanda-tangan/sandi.properties ]; then
+            echo "pribadi=true" >> "$GITHUB_OUTPUT"
+            echo "Tanda tangan pribadi ditemukan: APK dibangun versi rilis."
+          else
+            echo "pribadi=false" >> "$GITHUB_OUTPUT"
+            echo "Memakai tanda tangan bawaan GitHub: APK dibangun versi debug."
+          fi
+
+      - name: Ekstrak ZIP proyek
+        run: for z in *.zip; do [ -f "$z" ] && unzip -o "$z"; done
+
+      - name: Pasang Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Siapkan Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Pasang platform Android
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-34" "platforms;android-35" "build-tools;34.0.0" "build-tools;35.0.0"
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Tentukan versi Gradle sesuai proyek
+        id: gv
+        run: |
+          # Prioritas: versi di gradle-wrapper.properties; bila tidak ada, dari versi AGP; bila tidak terbaca, 9.3.1.
+          VER=""
+          WP=$(find . -maxdepth 5 -name gradle-wrapper.properties ! -path "*/build/*" | sort | head -n 1)
+          if [ -n "$WP" ]; then
+            VER=$(grep '^distributionUrl' "$WP" | sed -E 's/.*gradle-([0-9][0-9.]*[0-9])-(bin|all)\.zip.*/\1/' | head -n 1)
+            case "$VER" in [0-9]*) ;; *) VER="" ;; esac
+          fi
+          if [ -z "$VER" ]; then
+            AGP=$(grep -rhoE "com\.android\.(application|library)['\"]?[^0-9]{0,40}[0-9]+\.[0-9]+\.[0-9]+" --include=build.gradle --include=build.gradle.kts --include=settings.gradle --include=settings.gradle.kts --include=libs.versions.toml . 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n 1)
+            if [ -z "$AGP" ]; then
+              AGP=$(grep -rhE "^agp *=|gradle:[0-9]+\.[0-9]+\.[0-9]+" --include=libs.versions.toml --include=build.gradle --include=build.gradle.kts . 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n 1)
+            fi
+            MAJ=${AGP%%.*}; REST=${AGP#*.}; MIN=${REST%%.*}
+            if [ -z "$AGP" ]; then VER="9.3.1"
+            elif [ "$MAJ" -ge 9 ]; then VER="9.3.1"
+            elif [ "$MAJ" -eq 8 ]; then
+              if   [ "$MIN" -le 2 ]; then VER="8.5"
+              elif [ "$MIN" -le 5 ]; then VER="8.7"
+              elif [ "$MIN" -le 8 ]; then VER="8.10.2"
+              else VER="8.13"; fi
+            else VER="7.6.4"; fi
+            echo "Versi AGP terbaca: ${AGP:-tidak diketahui}"
+          fi
+          echo "Memakai Gradle $VER"
+          echo "versi=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Siapkan Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.gv.outputs.versi }}
+
+      - name: Pasang penjaga tanda tangan otomatis
+        if: steps.tt.outputs.pribadi == 'true'
+        run: |
+          set -e
+          if [ -f .tanda-tangan/tanpa-penjaga ]; then
+            echo "Perlindungan tanda tangan dimatikan untuk proyek ini."
+            exit 0
+          fi
+          EXIST=$(find . -name TTGuard.java ! -path '*/build/*' | head -n 1)
+          MAIN=$(find . \( -path "*/src/main/java/*" -o -path "*/src/main/kotlin/*" \) \( -name MainActivity.java -o -name MainActivity.kt \) ! -path "*/build/*" | sort | head -n 1)
+          cat > "$RUNNER_TEMP/TTGuard.src" <<'JAVA'
+          package __TT_PAKET__;
+
+          // tt-guard: v2
+
+          import android.app.Activity;
+          import android.app.Application;
+          import android.content.ContentProvider;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageManager;
+          import android.content.pm.Signature;
+          import android.content.pm.SigningInfo;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import java.io.RandomAccessFile;
+          import java.nio.ByteBuffer;
+          import java.nio.ByteOrder;
+          import java.security.MessageDigest;
+          import java.util.Random;
+
+          /**
+           * Penjaga tanda tangan (dibuat otomatis oleh GitHub by novan).
+           * Jika APK ditandatangani ulang dengan kunci lain, sidik jari sertifikat tidak cocok
+           * dan aplikasi ditutup. Pengecekan dilakukan dengan dua jalur yang berdiri sendiri:
+           * (1) PackageManager milik Android, dan (2) membaca langsung berkas APK yang terpasang
+           * (blok tanda tangan v2/v3), sehingga alat pemalsu tanda tangan yang hanya mengelabui
+           * PackageManager tetap ketahuan. Pengecekan berjalan saat aplikasi mulai, setiap layar tampil,
+           * berkala, dan dari MainActivity. Penutupan aplikasi ditunda secara acak supaya sulit dilacak.
+           * Sidik jari disimpan terpecah (dua bagian yang di-XOR), bukan sebagai teks utuh.
+           * Penjaga hanya aktif bila APK dibangun dengan tanda tangan pribadi.
+           */
+          public class TTGuard extends ContentProvider {
+              // Diisi otomatis oleh alur kerja GitHub Actions saat membangun dengan tanda tangan pribadi.
+              private static final String A = "__TT_A__";
+              private static final String B = "__TT_B__";
+              private static final String KOSONG = "__TT" + "_A__";
+              private static volatile boolean terpasang;
+              private static volatile boolean curang;
+              private static volatile boolean dijadwalkan;
+
+              private static boolean aktif() {
+                  return !KOSONG.equals(A);
+              }
+
+              @Override
+              public boolean onCreate() {
+                  if (!aktif()) return true; // bukan tanda tangan pribadi: penjaga tidak aktif
+                  Context c = getContext();
+                  periksa(c);
+                  pasangPengawas(c);
+                  return true;
+              }
+
+              /** Titik pengecekan: dipanggil dari provider, siklus layar, jadwal berkala, dan MainActivity. */
+              public static void periksa(Context c) {
+                  if (!aktif()) return;
+                  if (curang) {
+                      if (dijadwalkan) return;
+                      tutup(c);
+                      return;
+                  }
+                  boolean ok = false;
+                  try {
+                      ok = cocok(c);
+                  } catch (Throwable ignored) { }
+                  if (!ok) {
+                      curang = true;
+                      tutup(c);
+                  }
+              }
+
+              private static void pasangPengawas(final Context c) {
+                  if (terpasang) return;
+                  terpasang = true;
+                  try {
+                      Context ctx = c.getApplicationContext();
+                      if (ctx == null) ctx = c;
+                      if (ctx instanceof Application) {
+                          ((Application) ctx).registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+                              @Override public void onActivityCreated(Activity a, Bundle b) { periksa(a); }
+                              @Override public void onActivityStarted(Activity a) { }
+                              @Override public void onActivityResumed(Activity a) { periksa(a); }
+                              @Override public void onActivityPaused(Activity a) { }
+                              @Override public void onActivityStopped(Activity a) { }
+                              @Override public void onActivitySaveInstanceState(Activity a, Bundle b) { }
+                              @Override public void onActivityDestroyed(Activity a) { }
+                          });
+                      }
+                      final Context app = ctx;
+                      final Handler h = new Handler(Looper.getMainLooper());
+                      final Random r = new Random();
+                      h.postDelayed(new Runnable() {
+                          @Override public void run() {
+                              periksa(app);
+                              h.postDelayed(this, 30000L + r.nextInt(60000));
+                          }
+                      }, 20000L + r.nextInt(20000));
+                  } catch (Throwable ignored) { }
+              }
+
+              private static byte[] hex(String s) {
+                  int n = s.length() / 2;
+                  byte[] o = new byte[n];
+                  for (int i = 0; i < n; i++) {
+                      o[i] = (byte) Integer.parseInt(s.substring(2 * i, 2 * i + 2), 16);
+                  }
+                  return o;
+              }
+
+              private static byte[] harapan() {
+                  byte[] x = hex(A);
+                  byte[] y = hex(B);
+                  byte[] o = new byte[x.length];
+                  for (int i = 0; i < o.length; i++) o[i] = (byte) (x[i] ^ y[i % y.length]);
+                  return o;
+              }
+
+              private static boolean cocok(Context c) throws Exception {
+                  byte[] h = harapan();
+                  if (!cocokPaket(c, h)) return false;
+                  return cocokBerkas(c.getPackageCodePath(), h) != 0;
+              }
+
+              /** Jalur 1: sertifikat menurut PackageManager. */
+              private static boolean cocokPaket(Context c, byte[] h) throws Exception {
+                  PackageManager pm = c.getPackageManager();
+                  String pkg = c.getPackageName();
+                  Signature[] sigs;
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      PackageInfo pi = pm.getPackageInfo(pkg, PackageManager.GET_SIGNING_CERTIFICATES);
+                      SigningInfo si = pi.signingInfo;
+                      if (si == null) return false;
+                      sigs = si.getApkContentsSigners();
+                  } else {
+                      PackageInfo pi = pm.getPackageInfo(pkg, PackageManager.GET_SIGNATURES);
+                      sigs = pi.signatures;
+                  }
+                  if (sigs == null || sigs.length == 0) return false;
+                  for (Signature s : sigs) {
+                      byte[] d = MessageDigest.getInstance("SHA-256").digest(s.toByteArray());
+                      if (!MessageDigest.isEqual(d, h)) return false;
+                  }
+                  return true;
+              }
+
+              /** Jalur 2: 1 = cocok, 0 = beda, -1 = tidak terbaca (dilewati agar aplikasi asli tidak ikut tertutup). */
+              private static int cocokBerkas(String path, byte[] h) {
+                  try {
+                      byte[] s = sidikBerkas(path);
+                      if (s == null) return Build.VERSION.SDK_INT >= 24 ? 0 : -1; // APK modern wajib punya blok v2/v3
+                      return MessageDigest.isEqual(s, h) ? 1 : 0;
+                  } catch (Throwable t) {
+                      return -1;
+                  }
+              }
+
+              // ---- mulai pembaca blok tanda tangan ----
+              private static long le32(byte[] b, int o) {
+                  return (b[o] & 0xFFL) | ((b[o + 1] & 0xFFL) << 8) | ((b[o + 2] & 0xFFL) << 16) | ((b[o + 3] & 0xFFL) << 24);
+              }
+
+              private static long le64(byte[] b, int o) {
+                  return le32(b, o) | (le32(b, o + 4) << 32);
+              }
+
+              /** Ambil satu bagian berawalan panjang (uint32) dari buffer, lalu majukan posisi. */
+              private static ByteBuffer bagian(ByteBuffer b) {
+                  int n = b.getInt();
+                  if (n < 0 || n > b.remaining()) throw new IllegalStateException("bagian");
+                  ByteBuffer s = b.slice().order(ByteOrder.LITTLE_ENDIAN);
+                  s.limit(n);
+                  b.position(b.position() + n);
+                  return s;
+              }
+
+              /** SHA-256 sertifikat penanda tangan pertama dari blok v3 (atau v2); null bila tidak ada blok. */
+              static byte[] sidikBerkas(String path) throws Exception {
+                  RandomAccessFile f = new RandomAccessFile(path, "r");
+                  try {
+                      long len = f.length();
+                      int max = (int) Math.min(len, 65535L + 22L);
+                      byte[] tail = new byte[max];
+                      f.seek(len - max);
+                      f.readFully(tail);
+                      int e = -1;
+                      for (int i = max - 22; i >= 0; i--) {
+                          if (tail[i] == 0x50 && tail[i + 1] == 0x4b && tail[i + 2] == 5 && tail[i + 3] == 6
+                                  && i + 22 + (tail[i + 20] & 0xFF) + ((tail[i + 21] & 0xFF) << 8) == max) { e = i; break; }
+                      }
+                      if (e < 0) throw new IllegalStateException("eocd");
+                      long cd = le32(tail, e + 16);
+                      if (cd < 32 || cd > len) throw new IllegalStateException("cd");
+                      byte[] magic = new byte[16];
+                      f.seek(cd - 16);
+                      f.readFully(magic);
+                      if (!"APK Sig Block 42".equals(new String(magic, "ISO-8859-1"))) return null;
+                      byte[] sz = new byte[8];
+                      f.seek(cd - 24);
+                      f.readFully(sz);
+                      long size = le64(sz, 0);
+                      long start = cd - size - 8;
+                      if (size < 24 || start < 0 || size > 64L * 1024 * 1024) throw new IllegalStateException("blok");
+                      byte[] pairs = new byte[(int) (size - 24)];
+                      f.seek(start + 8);
+                      f.readFully(pairs);
+                      ByteBuffer b = ByteBuffer.wrap(pairs).order(ByteOrder.LITTLE_ENDIAN);
+                      ByteBuffer v2 = null, v3 = null;
+                      while (b.remaining() >= 12) {
+                          long l = b.getLong();
+                          int id = b.getInt();
+                          long vl = l - 4;
+                          if (vl < 0 || vl > b.remaining()) throw new IllegalStateException("pasangan");
+                          ByteBuffer v = b.slice().order(ByteOrder.LITTLE_ENDIAN);
+                          v.limit((int) vl);
+                          b.position(b.position() + (int) vl);
+                          if (id == 0xf05368c0) v3 = v;
+                          else if (id == 0x7109871a) v2 = v;
+                      }
+                      ByteBuffer pick = v3 != null ? v3 : v2;
+                      if (pick == null) return null;
+                      ByteBuffer signers = bagian(pick);
+                      ByteBuffer signer = bagian(signers);
+                      ByteBuffer signed = bagian(signer);
+                      bagian(signed);                       // daftar digest dilewati
+                      ByteBuffer certs = bagian(signed);
+                      ByteBuffer cert = bagian(certs);
+                      byte[] der = new byte[cert.remaining()];
+                      cert.get(der);
+                      return MessageDigest.getInstance("SHA-256").digest(der);
+                  } finally {
+                      f.close();
+                  }
+              }
+              // ---- akhir pembaca blok tanda tangan ----
+
+              /** Penutupan ditunda acak beberapa detik agar titik deteksi tidak mudah dilacak. */
+              private static void tutup(final Context c) {
+                  if (dijadwalkan) return;
+                  dijadwalkan = true;
+                  try {
+                      new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                          @Override public void run() { mati(c); }
+                      }, 2000L + new Random().nextInt(13000));
+                  } catch (Throwable t) {
+                      mati(c);
+                  }
+              }
+
+              private static void mati(Context c) {
+                  try {
+                      if (c instanceof Activity) ((Activity) c).finishAffinity();
+                  } catch (Throwable ignored) { }
+                  android.os.Process.killProcess(android.os.Process.myPid());
+                  System.exit(10);
+              }
+
+              @Override public Cursor query(Uri u, String[] p, String s, String[] a, String o) { return null; }
+              @Override public String getType(Uri u) { return null; }
+              @Override public Uri insert(Uri u, ContentValues v) { return null; }
+              @Override public int delete(Uri u, String s, String[] a) { return 0; }
+              @Override public int update(Uri u, ContentValues v, String s, String[] a) { return 0; }
+          }
+
+          JAVA
+          if [ -n "$EXIST" ]; then
+            if grep -q "tt-guard: v2" "$EXIST"; then
+              echo "Penjaga versi terbaru sudah ada di proyek."
+              exit 0
+            fi
+            PK=$(grep -m1 '^package ' "$EXIST" | sed -E 's/^package ([^;]+);.*/\1/')
+            if [ -n "$PK" ]; then
+              sed "s/__TT_PAKET__/$PK/g" "$RUNNER_TEMP/TTGuard.src" > "$EXIST"
+              echo "Penjaga lama diperbarui ke versi terbaru: $EXIST"
+            fi
+            exit 0
+          fi
+          if [ -z "$MAIN" ]; then
+            echo "::warning::MainActivity tidak ditemukan, penjaga tanda tangan tidak dipasang. APK tetap ditandatangani kunci pribadi."
+            exit 0
+          fi
+          python3 - "$MAIN" "$RUNNER_TEMP/TTGuard.src" <<'PY'
+          import os, re, sys
+          main, srcfile = sys.argv[1], sys.argv[2]
+          m = re.search(r'/src/main/(java|kotlin)/', main)
+          modul = main[:m.start()]
+          pkgdir = os.path.dirname(main[m.end():])
+          if not pkgdir:
+              print('::warning::MainActivity tanpa paket, penjaga tidak dipasang.')
+              sys.exit(0)
+          paket = pkgdir.replace('/', '.')
+          manifest = modul + '/src/main/AndroidManifest.xml'
+          if not os.path.isfile(manifest):
+              print('::warning::AndroidManifest.xml tidak ditemukan di ' + manifest + ', penjaga tidak dipasang.')
+              sys.exit(0)
+          x = open(manifest, encoding='utf-8').read()
+          k = x.rfind('</application>')
+          if k < 0:
+              print('::warning::Tag application tidak ditemukan di manifest, penjaga tidak dipasang.')
+              sys.exit(0)
+          guard = modul + '/src/main/java/' + pkgdir + '/TTGuard.java'
+          os.makedirs(os.path.dirname(guard), exist_ok=True)
+          src = open(srcfile, encoding='utf-8').read().replace('__TT_PAKET__', paket)
+          open(guard, 'w', encoding='utf-8').write(src)
+          if 'TTGuard' not in x:
+              prov = '        <provider android:name="' + paket + '.TTGuard" android:authorities="${' + 'applicationId}.ttguard" android:exported="false" android:initOrder="2147483647" />\n'
+              ls = x.rfind('\n', 0, k) + 1
+              x = x[:ls] + prov + x[ls:]
+              open(manifest, 'w', encoding='utf-8').write(x)
+          s = open(main, encoding='utf-8').read()
+          if 'TTGuard.periksa' not in s:
+              mm = re.search(r'super\.onCreate\([^)]*\);?', s)
+              if mm:
+                  s = s[:mm.end()] + '\n        TTGuard.periksa(this);' + s[mm.end():]
+                  open(main, 'w', encoding='utf-8').write(s)
+              else:
+                  print('::warning::onCreate tidak ditemukan di MainActivity; penjaga tetap aktif lewat provider dan jadwal berkala.')
+          print('Penjaga tanda tangan dipasang otomatis di paket ' + paket)
+          PY
+
+      - name: Pasang kelas kunci terikat tanda tangan otomatis
+        if: steps.tt.outputs.pribadi == 'true'
+        run: |
+          set -e
+          if [ -f .tanda-tangan/tanpa-enkripsi-string ]; then
+            echo "Enkripsi string otomatis dimatikan untuk proyek ini."
+            exit 0
+          fi
+          EXIST=$(find . -name KunciTandaTangan.java ! -path '*/build/*' | head -n 1)
+          MAIN=$(find . \( -path "*/src/main/java/*" -o -path "*/src/main/kotlin/*" \) \( -name MainActivity.java -o -name MainActivity.kt \) ! -path "*/build/*" | sort | head -n 1)
+          cat > "$RUNNER_TEMP/KunciTandaTangan.src" <<'JAVA'
+          package __KT_PAKET__;
+
+          // kt-guard: v2
+
+          import android.content.ContentProvider;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageManager;
+          import android.content.pm.Signature;
+          import android.content.pm.SigningInfo;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.util.Base64;
+          import java.nio.charset.StandardCharsets;
+          import java.security.MessageDigest;
+          import java.security.SecureRandom;
+          import javax.crypto.Cipher;
+          import javax.crypto.Mac;
+          import javax.crypto.spec.GCMParameterSpec;
+          import javax.crypto.spec.SecretKeySpec;
+
+          /**
+           * Kunci terikat tanda tangan (dibuat otomatis oleh GitHub by novan).
+           * Kunci enkripsi AES-256 diturunkan dari sidik jari sertifikat penanda tangan APK yang sedang
+           * berjalan (dibaca langsung dari PackageManager), digabung dengan rahasia yang disematkan khusus
+           * untuk build ini. Data atau fitur yang dienkripsi saat build hanya dapat dibaca kembali oleh APK
+           * yang masih memakai tanda tangan asli: bila APK ditandatangani ulang dengan kunci lain, sidik jari
+           * berubah sehingga kunci turunannya ikut berubah dan dekripsi gagal secara alami, tanpa ada
+           * pengecekan eksplisit yang bisa dihapus penyerang.
+           * Kunci hanya aktif bila APK dibangun dengan tanda tangan pribadi (lihat aktif()); pada build
+           * dengan tanda tangan bawaan GitHub, pemanggilan kunci()/enkripsi()/dekripsi() akan gagal.
+           *
+           * Enkripsi string otomatis: tandai teks tetap di kode dengan s("teks"). Selama build belum
+           * memprosesnya, s(...) hanya mengembalikan teks apa adanya sehingga aplikasi tetap berjalan
+           * normal. Saat APK dibangun dengan tanda tangan pribadi, alur kerja GitHub Actions menggantikan
+           * setiap pemanggilan s("teks asli") menjadi d("teks terenkripsi") sebelum kode dikompilasi, jadi
+           * teks aslinya tidak lagi tertulis di dalam APK. d(...) membaca konteks aplikasi yang ditangkap
+           * otomatis lewat Init (provider di AndroidManifest.xml), jadi tidak perlu diberi konteks manual.
+           */
+          public final class KunciTandaTangan {
+              // Diisi otomatis oleh alur kerja GitHub Actions saat membangun dengan tanda tangan pribadi.
+              private static final String RAHASIA = "__KT_RAHASIA__";
+              private static final String KOSONG = "__KT" + "_RAHASIA__";
+              private static volatile Context KONTEKS;
+
+              private KunciTandaTangan() { }
+
+              /** true bila rahasia build sudah disematkan (APK dibangun dengan tanda tangan pribadi). */
+              public static boolean aktif() {
+                  return !KOSONG.equals(RAHASIA);
+              }
+
+              private static byte[] hex(String s) {
+                  int n = s.length() / 2;
+                  byte[] o = new byte[n];
+                  for (int i = 0; i < n; i++) {
+                      o[i] = (byte) Integer.parseInt(s.substring(2 * i, 2 * i + 2), 16);
+                  }
+                  return o;
+              }
+
+              /** Sidik jari (SHA-256) sertifikat penanda tangan APK yang sedang berjalan. */
+              private static byte[] sidik(Context c) throws Exception {
+                  PackageManager pm = c.getPackageManager();
+                  String pkg = c.getPackageName();
+                  Signature[] sigs;
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      PackageInfo pi = pm.getPackageInfo(pkg, PackageManager.GET_SIGNING_CERTIFICATES);
+                      SigningInfo si = pi.signingInfo;
+                      if (si == null) throw new IllegalStateException("tanpa signingInfo");
+                      sigs = si.getApkContentsSigners();
+                  } else {
+                      PackageInfo pi = pm.getPackageInfo(pkg, PackageManager.GET_SIGNATURES);
+                      sigs = pi.signatures;
+                  }
+                  if (sigs == null || sigs.length == 0) throw new IllegalStateException("tanpa signature");
+                  MessageDigest md = MessageDigest.getInstance("SHA-256");
+                  for (Signature s : sigs) md.update(s.toByteArray());
+                  return md.digest();
+              }
+
+              /** Kunci AES-256 turunan sidik jari sertifikat asli + rahasia build ini. Beda tanda tangan = beda kunci. */
+              public static SecretKeySpec kunci(Context c) throws Exception {
+                  if (!aktif()) throw new IllegalStateException("kunci terikat tanda tangan tidak aktif pada build ini");
+                  Mac mac = Mac.getInstance("HmacSHA256");
+                  mac.init(new SecretKeySpec(hex(RAHASIA), "HmacSHA256"));
+                  byte[] k = mac.doFinal(sidik(c));
+                  return new SecretKeySpec(k, "AES");
+              }
+
+              /** Enkripsi AES/GCM; IV acak 12 byte disisipkan di awal hasil. */
+              public static byte[] enkripsi(Context c, byte[] data) throws Exception {
+                  SecretKeySpec k = kunci(c);
+                  byte[] iv = new byte[12];
+                  new SecureRandom().nextBytes(iv);
+                  Cipher ci = Cipher.getInstance("AES/GCM/NoPadding");
+                  ci.init(Cipher.ENCRYPT_MODE, k, new GCMParameterSpec(128, iv));
+                  byte[] ct = ci.doFinal(data);
+                  byte[] out = new byte[iv.length + ct.length];
+                  System.arraycopy(iv, 0, out, 0, iv.length);
+                  System.arraycopy(ct, 0, out, iv.length, ct.length);
+                  return out;
+              }
+
+              /** Dekripsi; melempar galat bila kunci salah (tanda tangan berbeda) atau data rusak. */
+              public static byte[] dekripsi(Context c, byte[] data) throws Exception {
+                  if (data == null || data.length < 13) throw new IllegalArgumentException("data tidak lengkap");
+                  SecretKeySpec k = kunci(c);
+                  byte[] iv = new byte[12];
+                  System.arraycopy(data, 0, iv, 0, 12);
+                  Cipher ci = Cipher.getInstance("AES/GCM/NoPadding");
+                  ci.init(Cipher.DECRYPT_MODE, k, new GCMParameterSpec(128, iv));
+                  return ci.doFinal(data, 12, data.length - 12);
+              }
+
+              public static String enkripsiTeks(Context c, String teks) throws Exception {
+                  return Base64.encodeToString(enkripsi(c, teks.getBytes(StandardCharsets.UTF_8)), Base64.NO_WRAP);
+              }
+
+              public static String dekripsiTeks(Context c, String base64) throws Exception {
+                  return new String(dekripsi(c, Base64.decode(base64, Base64.DEFAULT)), StandardCharsets.UTF_8);
+              }
+
+              /** Versi aman untuk dipakai di fitur: null bila gagal (tanda tangan beda, rusak, atau belum aktif). */
+              public static String dekripsiTeksAtauNull(Context c, String base64) {
+                  try {
+                      return dekripsiTeks(c, base64);
+                  } catch (Throwable t) {
+                      return null;
+                  }
+              }
+
+              /**
+               * Tandai teks tetap di kode yang ingin disembunyikan dari hasil APK, contoh:
+               * String alamat = KunciTandaTangan.s("https://server-rahasia.contoh/api");
+               * Di sini teks dikembalikan apa adanya. Alur kerja build yang menggantikannya dengan d(...)
+               * saat APK dibangun dengan tanda tangan pribadi, jadi aman dipakai di build apa pun: bila
+               * belum/tidak diproses, aplikasi tetap berjalan normal dengan teks aslinya.
+               */
+              public static String s(String teksAsli) {
+                  return teksAsli;
+              }
+
+              /**
+               * Dipanggil otomatis oleh alur kerja build (menggantikan pemanggilan s(...)) untuk teks yang
+               * sudah dienkripsi. Mengembalikan teks asli bila berhasil didekripsi, atau teks kosong ("")
+               * bila gagal (tanda tangan berbeda, konteks belum siap, atau belum aktif) -- tidak pernah
+               * melempar galat.
+               */
+              public static String d(String base64) {
+                  Context c = KONTEKS;
+                  if (c == null) return "";
+                  String r = dekripsiTeksAtauNull(c, base64);
+                  return r == null ? "" : r;
+              }
+
+              /**
+               * Menangkap konteks aplikasi secara otomatis saat proses dimulai (dipasang lewat
+               * AndroidManifest.xml), supaya d(...) tidak perlu diberi konteks secara manual di setiap
+               * pemanggilan. Tidak melakukan apa pun selain itu.
+               */
+              public static final class Init extends ContentProvider {
+                  @Override
+                  public boolean onCreate() {
+                      Context c = getContext();
+                      if (c != null) {
+                          Context app = c.getApplicationContext();
+                          KONTEKS = app != null ? app : c;
+                      }
+                      return true;
+                  }
+
+                  @Override public Cursor query(Uri u, String[] p, String s, String[] a, String o) { return null; }
+                  @Override public String getType(Uri u) { return null; }
+                  @Override public Uri insert(Uri u, ContentValues v) { return null; }
+                  @Override public int delete(Uri u, String s, String[] a) { return 0; }
+                  @Override public int update(Uri u, ContentValues v, String s, String[] a) { return 0; }
+              }
+          }
+
+          JAVA
+          if [ -n "$EXIST" ]; then
+            if grep -q "kt-guard: v2" "$EXIST"; then
+              echo "Kelas kunci terikat tanda tangan versi terbaru sudah ada di proyek."
+              exit 0
+            fi
+            PK=$(grep -m1 '^package ' "$EXIST" | sed -E 's/^package ([^;]+);.*/\1/')
+            if [ -n "$PK" ]; then
+              sed "s/__KT_PAKET__/$PK/g" "$RUNNER_TEMP/KunciTandaTangan.src" > "$EXIST"
+              echo "Kelas kunci terikat tanda tangan diperbarui ke versi terbaru (termasuk s()/d() untuk enkripsi string otomatis): $EXIST"
+            fi
+            exit 0
+          fi
+          if [ -z "$MAIN" ]; then
+            echo "::warning::MainActivity tidak ditemukan, kelas kunci terikat tanda tangan tidak dipasang."
+            exit 0
+          fi
+          python3 - "$MAIN" "$RUNNER_TEMP/KunciTandaTangan.src" <<'PY'
+          import os, re, sys
+          main, srcfile = sys.argv[1], sys.argv[2]
+          m = re.search(r'/src/main/(java|kotlin)/', main)
+          modul = main[:m.start()]
+          pkgdir = os.path.dirname(main[m.end():])
+          if not pkgdir:
+              print('::warning::MainActivity tanpa paket, kelas kunci terikat tanda tangan tidak dipasang.')
+              sys.exit(0)
+          paket = pkgdir.replace('/', '.')
+          guard = modul + '/src/main/java/' + pkgdir + '/KunciTandaTangan.java'
+          os.makedirs(os.path.dirname(guard), exist_ok=True)
+          src = open(srcfile, encoding='utf-8').read().replace('__KT_PAKET__', paket)
+          open(guard, 'w', encoding='utf-8').write(src)
+          manifest = modul + '/src/main/AndroidManifest.xml'
+          if os.path.isfile(manifest):
+              x = open(manifest, encoding='utf-8').read()
+              k = x.rfind('</application>')
+              if k >= 0 and 'KunciTandaTangan$Init' not in x:
+                  prov = '        <provider android:name="' + paket + '.KunciTandaTangan$Init" android:authorities="${' + 'applicationId}.ktguard" android:exported="false" android:initOrder="2147483647" />\n'
+                  ls = x.rfind('\n', 0, k) + 1
+                  x = x[:ls] + prov + x[ls:]
+                  open(manifest, 'w', encoding='utf-8').write(x)
+          print('Kelas kunci terikat tanda tangan dipasang otomatis di paket ' + paket)
+          PY
+
+      - name: Sematkan sidik jari tanda tangan (perlindungan tanda tangan ulang)
+        if: steps.tt.outputs.pribadi == 'true'
+        run: |
+          set -e
+          if [ -f .tanda-tangan/tanpa-penjaga ]; then
+            echo "Perlindungan tanda tangan dimatikan untuk proyek ini."
+            exit 0
+          fi
+          GUARDS=$(grep -rlE "__TT_(A|HASH)__" --include=TTGuard.java . 2>/dev/null || true)
+          if [ -z "$GUARDS" ]; then
+            echo "Perlindungan tanda tangan tidak dipakai di proyek ini."
+            exit 0
+          fi
+          KS="$GITHUB_WORKSPACE/.tanda-tangan/kunci.p12"
+          PROP="$GITHUB_WORKSPACE/.tanda-tangan/sandi.properties"
+          KS_ALIAS=$(grep '^alias=' "$PROP" | head -n 1 | cut -d= -f2- | tr -d '\r')
+          KS_PASS=$(grep '^sandi=' "$PROP" | head -n 1 | cut -d= -f2- | tr -d '\r')
+          HASH=$(keytool -J-Duser.language=en -list -v -keystore "$KS" -storetype PKCS12 -alias "$KS_ALIAS" -storepass "$KS_PASS" | grep -m1 'SHA256:' | sed 's/.*SHA256:[[:space:]]*//' | tr -d ' \r' | tr 'a-f' 'A-F')
+          if [ "${#HASH}" -ne 95 ]; then
+            echo "Gagal membaca sidik jari tanda tangan. Pembangunan dihentikan agar APK tidak terbit tanpa perlindungan."
+            exit 1
+          fi
+          HEX=$(echo "$HASH" | tr -d ':')
+          KEY=$(openssl rand -hex 32 | tr 'a-f' 'A-F')
+          MASKED=$(python3 -c "import sys; h=bytes.fromhex(sys.argv[1]); k=bytes.fromhex(sys.argv[2]); print(bytes(a^b for a,b in zip(h,k)).hex().upper())" "$HEX" "$KEY")
+          for G in $GUARDS; do
+            sed -i -e "s/__TT_HASH__/$HASH/g" -e "s/__TT_A__/$MASKED/g" -e "s/__TT_B__/$KEY/g" "$G"
+            echo "Sidik jari tanda tangan disematkan ke $G"
+          done
+
+      - name: Sematkan kunci terikat tanda tangan (lindungi data/fitur)
+        if: steps.tt.outputs.pribadi == 'true'
+        run: |
+          set -e
+          if [ -f .tanda-tangan/tanpa-enkripsi-string ]; then
+            echo "Enkripsi string otomatis dimatikan untuk proyek ini."
+            exit 0
+          fi
+          FILES=$(grep -rl "__KT_RAHASIA__" --include=KunciTandaTangan.java . 2>/dev/null || true)
+          if [ -z "$FILES" ]; then
+            echo "Kunci terikat tanda tangan tidak dipakai di proyek ini."
+            exit 0
+          fi
+          RAHASIA=$(openssl rand -hex 32)
+          for G in $FILES; do
+            sed -i "s/__KT_RAHASIA__/$RAHASIA/g" "$G"
+            echo "Rahasia kunci terikat tanda tangan disematkan ke $G"
+          done
+
+      - name: Enkripsi string otomatis (tersemat saat build)
+        if: steps.tt.outputs.pribadi == 'true'
+        run: |
+          set -e
+          if [ -f .tanda-tangan/tanpa-enkripsi-string ]; then
+            echo "Enkripsi string otomatis dimatikan untuk proyek ini."
+            exit 0
+          fi
+          KTFILE=$(find . -name KunciTandaTangan.java ! -path '*/build/*' | head -n 1)
+          if [ -z "$KTFILE" ] || ! grep -q "kt-guard: v2" "$KTFILE"; then
+            echo "Kelas kunci terikat tanda tangan (versi mendukung enkripsi string otomatis) tidak ditemukan."
+            exit 0
+          fi
+          FILES=$(find . \( -name "*.java" -o -name "*.kt" \) ! -path "*/build/*" ! -name "KunciTandaTangan.java" ! -name "TTGuard.java" 2>/dev/null || true)
+          if [ -z "$FILES" ]; then
+            echo "Tidak ada berkas Java/Kotlin untuk dipindai; tidak ada teks yang dienkripsi."
+            exit 0
+          fi
+          RAHASIA=$(grep -m1 'RAHASIA = "' "$KTFILE" | sed -E 's/.*RAHASIA = "([^"]*)".*/\1/')
+          if [ -z "$RAHASIA" ] || [ "$RAHASIA" = "__KT_RAHASIA__" ]; then
+            echo "::warning::Rahasia kunci terikat tanda tangan belum tersemat; enkripsi string otomatis dilewati."
+            exit 0
+          fi
+          KS="$GITHUB_WORKSPACE/.tanda-tangan/kunci.p12"
+          PROP="$GITHUB_WORKSPACE/.tanda-tangan/sandi.properties"
+          KS_ALIAS=$(grep '^alias=' "$PROP" | head -n 1 | cut -d= -f2- | tr -d '\r')
+          KS_PASS=$(grep '^sandi=' "$PROP" | head -n 1 | cut -d= -f2- | tr -d '\r')
+          HASH=$(keytool -J-Duser.language=en -list -v -keystore "$KS" -storetype PKCS12 -alias "$KS_ALIAS" -storepass "$KS_PASS" | grep -m1 'SHA256:' | sed 's/.*SHA256:[[:space:]]*//' | tr -d ' \r:' | tr 'A-F' 'a-f')
+          if [ "${#HASH}" -ne 64 ]; then
+            echo "::warning::Gagal membaca sidik jari tanda tangan; enkripsi string otomatis dilewati (teks tetap apa adanya)."
+            exit 0
+          fi
+          if ! pip install -q --disable-pip-version-check cryptography; then
+            echo "::warning::Gagal memasang alat enkripsi (mungkin masalah jaringan sesaat); enkripsi string otomatis dilewati kali ini. Teks tetap apa adanya, APK tetap dibangun seperti biasa."
+            exit 0
+          fi
+          if ! python3 - "$RAHASIA" "$HASH" $FILES <<'PY'
+          import hmac, hashlib, os, re, sys, base64
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          rahasia, cert_hash = sys.argv[1], sys.argv[2]
+          files = sys.argv[3:]
+          key = hmac.new(bytes.fromhex(rahasia), bytes.fromhex(cert_hash), hashlib.sha256).digest()
+          aes = AESGCM(key)
+
+          lit_pat = re.compile(r'"((?:[^"\\]|\\.)*)"')
+          wrap_pat = re.compile(r'KunciTandaTangan\.s\(\s*"((?:[^"\\]|\\.)*)"\s*\)')
+          fmt_pat = re.compile(r'%[0-9]*\$?[-+0 #]*[0-9]*\.?[0-9]*[sdfeEgGxXobc%]|\{[0-9]+\}')
+
+          def unescape(t):
+              out, i = [], 0
+              simple = {'n': '\n', 't': '\t', 'r': '\r', '"': '"', '\\': '\\', "'": "'"}
+              ok = True
+              while i < len(t):
+                  c = t[i]
+                  if c == '\\' and i + 1 < len(t):
+                      nx = t[i + 1]
+                      if nx in simple:
+                          out.append(simple[nx]); i += 2; continue
+                      ok = False
+                      out.append(c); i += 1; continue
+                  out.append(c); i += 1
+              return ''.join(out), ok
+
+          def enc(teks):
+              iv = os.urandom(12)
+              ct = aes.encrypt(iv, teks.encode('utf-8'), None)
+              return base64.b64encode(iv + ct).decode('ascii')
+
+          def eligible(teks):
+              # Teks pendek, berisi format (%s/%d/{0}), atau tanpa spasi (kemungkinan
+              # kunci/identifier/nama aksi/mime) dilewati demi keamanan kompilasi dan fungsi.
+              if len(teks) < 4:
+                  return False
+              if fmt_pat.search(teks):
+                  return False
+              if '://' in teks:
+                  return True
+              if not re.search(r'\s', teks):
+                  return False
+              return True
+
+          total_mark = 0
+          total_auto = 0
+          for f in files:
+              try:
+                  src = open(f, encoding='utf-8').read()
+              except Exception as e:
+                  print('::warning::Gagal membaca ' + f + ': ' + str(e))
+                  continue
+              changed = False
+
+              def ganti_mark(m):
+                  global changed, total_mark
+                  teks, ok = unescape(m.group(1))
+                  if not ok:
+                      print('::warning::Dilewati (escape tidak didukung) di ' + f + ': ' + m.group(0))
+                      return m.group(0)
+                  changed = True
+                  total_mark += 1
+                  return 'KunciTandaTangan.d("' + enc(teks) + '")'
+
+              src = wrap_pat.sub(ganti_mark, src)
+
+              out_lines = []
+              in_const_block = False
+              for line in src.split('\n'):
+                  stripped = line.strip()
+                  skip_line = (
+                      stripped.startswith('//') or stripped.startswith('*') or stripped.startswith('/*')
+                      or stripped.startswith('package ') or stripped.startswith('import ')
+                      or stripped.startswith('@') or re.match(r'^(case\s|default\s*:)', stripped)
+                      or 'KunciTandaTangan.d(' in line
+                  )
+                  has_static_final = bool(re.search(r'\bstatic\s+final\b', line))
+                  if has_static_final and line.rstrip().endswith('{'):
+                      in_const_block = True
+                  const_line = in_const_block or has_static_final
+                  if in_const_block and '}' in line:
+                      in_const_block = False
+                  if skip_line or const_line:
+                      out_lines.append(line)
+                      continue
+                  def ganti_lit(m):
+                      global changed, total_auto
+                      teks, ok = unescape(m.group(1))
+                      if not ok:
+                          return m.group(0)
+                      before = line[:m.start()].rstrip()
+                      if re.search(r'\bLog\.(d|e|w|i|v|wtf)\s*\($', before):
+                          return m.group(0)
+                      if not eligible(teks):
+                          return m.group(0)
+                      changed = True
+                      total_auto += 1
+                      return 'KunciTandaTangan.d("' + enc(teks) + '")'
+
+                  out_lines.append(lit_pat.sub(ganti_lit, line))
+
+              out = '\n'.join(out_lines)
+              if changed:
+                  open(f, 'w', encoding='utf-8').write(out)
+                  print('Teks dienkripsi di ' + f)
+          print(str(total_mark) + ' teks bertanda s(...) dan ' + str(total_auto)
+                + ' teks lain terdeteksi otomatis, total dienkripsi sebelum kompilasi.')
+          PY
+          then
+            echo "::warning::Enkripsi string otomatis gagal diproses kali ini; teks yang belum sempat diganti tetap apa adanya, APK tetap dibangun seperti biasa."
+          fi
+
+      - name: Terapkan R8 bila dicentang
+        id: r8
+        if: steps.tt.outputs.pribadi == 'true'
+        run: |
+          set -e
+          if [ ! -f .tanda-tangan/r8 ]; then
+            echo "R8 tidak dicentang: APK rilis tidak dikecilkan."
+            echo "R8_ON=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          GRADLE_FILE=$(find . \( -name build.gradle -o -name build.gradle.kts \) -path "*/app/*" ! -path "*/build/*" | sort | head -n 1)
+          if [ -z "$GRADLE_FILE" ]; then
+            echo "::warning::build.gradle modul app tidak ditemukan, R8 tidak diterapkan."
+            echo "R8_ON=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          BAK="$RUNNER_TEMP/build-gradle.bak"
+          cp "$GRADLE_FILE" "$BAK"
+          PATCH_RC=0
+          python3 - "$GRADLE_FILE" <<'PY' || PATCH_RC=$?
+          import re, sys
+
+          def tutup(s, buka):
+              # indeks kurung kurawal penutup yang berpasangan dengan kurung buka di posisi 'buka'
+              d = 0
+              for n in range(buka, len(s)):
+                  if s[n] == '{':
+                      d += 1
+                  elif s[n] == '}':
+                      d -= 1
+                      if d == 0:
+                          return n
+              return -1
+
+          f = sys.argv[1]
+          s = open(f, encoding='utf-8').read()
+          kts = f.endswith('.kts')
+          bt = re.search(r'buildTypes\s*\{', s)
+          if not bt:
+              print('blok buildTypes tidak ditemukan')
+              sys.exit(3)
+          bt_buka = bt.end() - 1
+          bt_tutup = tutup(s, bt_buka)
+          if bt_tutup < 0:
+              print('blok buildTypes tidak berpasangan')
+              sys.exit(3)
+          dalam = s[bt_buka:bt_tutup]
+          rel = re.search(r'(?:\brelease|(?:getByName|named|maybeCreate|create)\(\s*["\']release["\']\s*\))\s*\{', dalam)
+          if not rel:
+              print('blok release tidak ditemukan di buildTypes')
+              sys.exit(3)
+          r_buka = bt_buka + rel.end() - 1
+          r_tutup = tutup(s, r_buka)
+          if r_tutup < 0:
+              print('blok release tidak berpasangan')
+              sys.exit(3)
+          blok = s[r_buka:r_tutup]
+          pola = r'\b(is[Mm]inifyEnabled|minifyEnabled)(\s*=\s*|\s+)(true|false)\b'
+          if re.search(pola, blok):
+              blok2 = re.sub(pola, lambda m: m.group(1) + m.group(2) + 'true', blok)
+          else:
+              baris = 'isMinifyEnabled = true' if kts else 'minifyEnabled true'
+              blok2 = '{\n            ' + baris + blok[1:]
+          if not re.search(r'\b(is[Mm]inifyEnabled|minifyEnabled)(\s*=\s*|\s+)true\b', blok2):
+              print('gagal memastikan minify aktif setelah diubah')
+              sys.exit(3)
+          s = s[:r_buka] + blok2 + s[r_tutup:]
+          open(f, 'w', encoding='utf-8').write(s)
+          print('R8 diaktifkan untuk build rilis di ' + f)
+          PY
+          if [ "$PATCH_RC" -ne 0 ]; then
+            echo "::warning::Pengaturan release di $GRADLE_FILE tidak bisa diubah otomatis, R8 tidak diterapkan."
+            echo "R8_ON=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "R8_ON=true" >> "$GITHUB_ENV"
+          echo "R8_FILE=$GITHUB_WORKSPACE/$GRADLE_FILE" >> "$GITHUB_ENV"
+          echo "R8_BAK=$BAK" >> "$GITHUB_ENV"
+
+      - name: Perkuat aturan ProGuard/R8 (obfuskasi lebih kuat)
+        if: steps.tt.outputs.pribadi == 'true' && env.R8_ON == 'true'
+        run: |
+          set -e
+          if [ ! -f .tanda-tangan/obfuskasi-kuat ]; then
+            echo "Obfuskasi lebih kuat tidak dicentang."
+            exit 0
+          fi
+          RULES="$RUNNER_TEMP/kuat-rules.pro"
+          cat > "$RULES" <<'PRO'
+
+          # --- novan-obfuskasi-kuat: v1 ---
+          -repackageclasses ''
+          -allowaccessmodification
+
+          # Jaga metode native (JNI) tetap bisa dipanggil
+          -keepclasseswithmembernames,includedescriptorclasses class * {
+              native <methods>;
+          }
+
+          # Jaga Parcelable CREATOR
+          -keep class * implements android.os.Parcelable {
+            public static final android.os.Parcelable$Creator *;
+          }
+
+          # Jaga Serializable
+          -keepclassmembers class * implements java.io.Serializable {
+              static final long serialVersionUID;
+              private static final java.io.ObjectStreamField[] serialPersistentFields;
+              private void writeObject(java.io.ObjectOutputStream);
+              private void readObject(java.io.ObjectInputStream);
+              java.lang.Object writeReplace();
+              java.lang.Object readResolve();
+          }
+
+          # Jaga enum valueOf/values
+          -keepclassmembers enum * {
+              public static **[] values();
+              public static ** valueOf(java.lang.String);
+          }
+
+          # Jaga konstruktor View yang dipanggil dari XML
+          -keepclasseswithmembers class * extends android.view.View {
+              public <init>(android.content.Context);
+              public <init>(android.content.Context, android.util.AttributeSet);
+              public <init>(android.content.Context, android.util.AttributeSet, int);
+          }
+          PRO
+          FILES=$(find . \( -name "proguard-rules.pro" -o -name "proguard-rules.txt" \) ! -path "*/build/*")
+          if [ -z "$FILES" ]; then
+            GRADLE_FILE=$(find . \( -name build.gradle -o -name build.gradle.kts \) -path "*/app/*" ! -path "*/build/*" | sort | head -n 1)
+            if [ -z "$GRADLE_FILE" ]; then
+              echo "::warning::build.gradle modul app tidak ditemukan, obfuskasi lebih kuat tidak diterapkan."
+              exit 0
+            fi
+            MODUL=$(dirname "$GRADLE_FILE")
+            NEWFILE="$MODUL/proguard-rules.pro"
+            PATCH_RC=0
+            python3 - "$GRADLE_FILE" <<'PY' || PATCH_RC=$?
+          import re, sys
+
+          def tutup(s, buka):
+              d = 0
+              for n in range(buka, len(s)):
+                  if s[n] == '{':
+                      d += 1
+                  elif s[n] == '}':
+                      d -= 1
+                      if d == 0:
+                          return n
+              return -1
+
+          f = sys.argv[1]
+          s = open(f, encoding='utf-8').read()
+          kts = f.endswith('.kts')
+          bt = re.search(r'buildTypes\s*\{', s)
+          if not bt:
+              print('blok buildTypes tidak ditemukan')
+              sys.exit(3)
+          bt_buka = bt.end() - 1
+          bt_tutup = tutup(s, bt_buka)
+          if bt_tutup < 0:
+              print('blok buildTypes tidak berpasangan')
+              sys.exit(3)
+          dalam = s[bt_buka:bt_tutup]
+          rel = re.search(r'(?:\brelease|(?:getByName|named|maybeCreate|create)\(\s*["\']release["\']\s*\))\s*\{', dalam)
+          if not rel:
+              print('blok release tidak ditemukan di buildTypes')
+              sys.exit(3)
+          r_buka = bt_buka + rel.end() - 1
+          r_tutup = tutup(s, r_buka)
+          if r_tutup < 0:
+              print('blok release tidak berpasangan')
+              sys.exit(3)
+          blok = s[r_buka:r_tutup]
+          if 'proguardFiles' in blok:
+              print('proguardFiles sudah ada, tidak diubah')
+              sys.exit(0)
+          if kts:
+              baris = '            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")\n'
+          else:
+              baris = "            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'\n"
+          blok2 = '{\n' + baris + blok[1:]
+          s = s[:r_buka] + blok2 + s[r_tutup:]
+          open(f, 'w', encoding='utf-8').write(s)
+          print('proguardFiles ditambahkan ke ' + f)
+          PY
+            if [ "$PATCH_RC" -ne 0 ]; then
+              echo "::warning::Pengaturan release di $GRADLE_FILE tidak bisa diubah otomatis, obfuskasi lebih kuat tidak diterapkan."
+              exit 0
+            fi
+            echo "# Dibuat otomatis oleh GitHub by novan (obfuskasi lebih kuat)." > "$NEWFILE"
+            cat "$RULES" >> "$NEWFILE"
+            echo "Berkas $NEWFILE dibuat dan disambungkan ke $GRADLE_FILE"
+            exit 0
+          fi
+          for F in $FILES; do
+            if grep -q "novan-obfuskasi-kuat" "$F" 2>/dev/null; then
+              echo "Aturan obfuskasi lebih kuat sudah ada di $F"
+              continue
+            fi
+            cat "$RULES" >> "$F"
+            echo "Aturan obfuskasi lebih kuat ditambahkan ke $F"
+          done
+
+      - name: Kompilasi APK Android
+        env:
+          PRIBADI: ${{ steps.tt.outputs.pribadi }}
+          R8_ON: ${{ env.R8_ON }}
+          R8_FILE: ${{ env.R8_FILE }}
+          R8_BAK: ${{ env.R8_BAK }}
+        run: |
+          ROOT_DIR=$(find . -maxdepth 4 \( -name "settings.gradle" -o -name "settings.gradle.kts" \) ! -path "*/build/*" | head -n 1)
+          if [ -z "$ROOT_DIR" ]; then
+            ROOT_DIR=$(find . -maxdepth 4 \( -name "build.gradle" -o -name "build.gradle.kts" \) ! -path "*/build/*" ! -path "*/app/*" | head -n 1)
+          fi
+          if [ -z "$ROOT_DIR" ]; then
+            ROOT_DIR=$(find . -maxdepth 4 \( -name "build.gradle*" \) ! -path "*/build/*" | head -n 1)
+          fi
+          [ -n "$ROOT_DIR" ] && cd "$(dirname "$ROOT_DIR")"
+
+          # gradlew hanya dipakai bila lengkap (ada gradle-wrapper.jar dan properties); kalau tidak, pakai Gradle dari setup-gradle.
+          if [ -f "./gradlew" ] && [ -f "./gradle/wrapper/gradle-wrapper.jar" ] && [ -f "./gradle/wrapper/gradle-wrapper.properties" ]; then
+            chmod +x ./gradlew
+            RUN_GRADLE="./gradlew"
+          else
+            echo "gradlew tidak lengkap atau tidak ada: memakai Gradle dari setup-gradle."
+            RUN_GRADLE="gradle"
+          fi
+
+          if [ "$PRIBADI" = "true" ]; then
+            if ! $RUN_GRADLE assembleRelease --no-daemon -x lint -x test; then
+              if [ "$R8_ON" = "true" ] && [ -f "$R8_BAK" ]; then
+                echo "::warning::Build rilis dengan R8 gagal. Mengulang tanpa R8."
+                cp "$R8_BAK" "$R8_FILE"
+                $RUN_GRADLE assembleRelease --no-daemon -x lint -x test || $RUN_GRADLE assembleDebug --no-daemon -x lint -x test
+              else
+                $RUN_GRADLE assembleDebug --no-daemon -x lint -x test
+              fi
+            fi
+          else
+            $RUN_GRADLE assembleDebug --no-daemon -x lint -x test
+          fi
+
+      - name: Tandatangani APK dengan kunci pribadi
+        if: steps.tt.outputs.pribadi == 'true'
+        run: |
+          set -e
+          KS="$GITHUB_WORKSPACE/.tanda-tangan/kunci.p12"
+          PROP="$GITHUB_WORKSPACE/.tanda-tangan/sandi.properties"
+          export KS_ALIAS=$(grep '^alias=' "$PROP" | head -n 1 | cut -d= -f2- | tr -d '\r')
+          export KS_PASS=$(grep '^sandi=' "$PROP" | head -n 1 | cut -d= -f2- | tr -d '\r')
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          APKS=$(find . -path "*/build/outputs/apk/*" -name "*.apk" ! -name "*aligned*" ! -name "*idsig*")
+          test -n "$APKS" || { echo "Berkas APK tidak ditemukan!"; exit 1; }
+          for APK in $APKS; do
+            "$BT/zipalign" -p -f 4 "$APK" "$APK.aligned"
+            "$BT/apksigner" sign --ks "$KS" --ks-type PKCS12 --ks-key-alias "$KS_ALIAS" --ks-pass env:KS_PASS --key-pass env:KS_PASS --out "$APK" "$APK.aligned"
+            rm -f "$APK.aligned" "$APK.idsig"
+          done
+          FIRST=$(echo "$APKS" | head -n 1)
+          "$BT/apksigner" verify --print-certs "$FIRST"
+
+      - name: Siapkan berkas APK
+        env:
+          PRIBADI: ${{ steps.tt.outputs.pribadi }}
+        run: |
+          # Urutan dibuat tetap (sort) supaya varian yang dipilih selalu sama di setiap pembangunan.
+          APK_PATH=""
+          if [ "$PRIBADI" = "true" ]; then
+            APK_PATH=$(find . \( -path "*/build/outputs/apk/release/*" -o -path "*/build/outputs/apk/*/release/*" \) -name "*.apk" | sort | head -n 1)
+          fi
+          if [ -z "$APK_PATH" ]; then
+            APK_PATH=$(find . -path "*/build/outputs/apk/*" -name "*.apk" | sort | head -n 1)
+          fi
+          test -n "$APK_PATH" || { echo "Berkas APK tidak ditemukan!"; exit 1; }
+          cp "$APK_PATH" "asa-v${{ github.run_number }}.apk"
+
+      # Artefak hanya cadangan sementara (1 hari) dan tidak boleh menggagalkan build bila kuota
+      # penyimpanan artefak GitHub penuh; APK tetap terbit ke GitHub Release di langkah berikutnya.
+      - name: Simpan Artefak APK
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: APK-asa-${{ github.run_number }}
+          path: "asa-v${{ github.run_number }}.apk"
+          retention-days: 1
+
+      - name: Terbitkan ke GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Versi v${{ github.run_number }}
+          generate_release_notes: false
+          files: "asa-v${{ github.run_number }}.apk"
